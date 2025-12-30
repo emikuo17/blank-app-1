@@ -1,53 +1,45 @@
-import json
 import io
+import json
 import time
-from typing import Any, Dict, Optional, Tuple
+import zipfile
+from typing import Optional, List, Dict
 
 import pandas as pd
 import streamlit as st
 
-# --- OPTIONAL: OpenAI SDK (recommended). If you prefer another provider, swap the `call_llm()` function. ---
-# pip install openai
+# Optional OpenAI SDK
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
 
-# =========================
-# Helpers
-# =========================
-def safe_json_loads(s: str) -> Tuple[Optional[Any], Optional[str]]:
-    try:
-        return json.loads(s), None
-    except Exception as e:
-        return None, str(e)
+# -----------------------
+# State
+# -----------------------
+def init_state():
+    if "chat" not in st.session_state:
+        st.session_state.chat = []  # [{"role":"user|assistant","content":"..."}]
+    if "llm_confirmed" not in st.session_state:
+        st.session_state.llm_confirmed = False
+    if "last_confirm_result" not in st.session_state:
+        st.session_state.last_confirm_result = ""
+    if "datasets" not in st.session_state:
+        # dict: filename -> dataframe
+        st.session_state.datasets = {}
 
 
-def df_preview(df: pd.DataFrame, max_rows: int = 10) -> str:
-    if df is None or df.empty:
-        return ""
-    preview = df.head(max_rows).to_markdown(index=False)
-    return preview
+# -----------------------
+# Defaults (Structured Prompts)
+# -----------------------
+DEFAULT_TASK = "You are an ODI mountain bike grips expert who provides grip recommendations to users."
+DEFAULT_PERSONA = "The user is an experienced mountain biker. Use technical terms and slang."
+DEFAULT_TONE = "Respond in a professional and informative tone, similar to a customer service representative."
 
 
-def dataset_to_compact_context(df: Optional[pd.DataFrame], max_rows: int = 12) -> str:
-    """Turn uploaded dataset into a compact, LLM-friendly context string."""
-    if df is None or df.empty:
-        return ""
-    cols = list(df.columns)
-    ctx = []
-    ctx.append("Uploaded dataset is available. Use it to answer questions when relevant.")
-    ctx.append(f"Columns: {cols}")
-    ctx.append("Top rows (preview):")
-    ctx.append(df.head(max_rows).to_csv(index=False))
-    return "\n".join(ctx)
-
-
-def build_system_prompt(task: str, persona: str, tone: str, data_access: str) -> str:
-    # Keep it explicit & structured for the model
+def build_system_prompt(task: str, persona: str, tone: str, dataset_context: str) -> str:
     return f"""
-You are ODI mountain bike grips assistant.
+You are an ODI mountain bike grips assistant.
 
 [Task Definition]
 {task}
@@ -58,35 +50,25 @@ You are ODI mountain bike grips assistant.
 [Tone & Language Style]
 {tone}
 
-[Data Access / Product Facts]
-{data_access}
+[Dataset Context]
+{dataset_context}
 
 [Rules]
-- Recommend ODI grips and explain why in MTB terms (feel, damping, tack, flange, diameter, trail type).
-- Ask 1-2 quick clarifying questions ONLY if needed (hand size, glove size, terrain, preference for flange, diameter).
-- If dataset is provided, prefer it as the source of truth for product specs.
-- Be concise but helpful: bullet points + a short recommendation summary.
+- Recommend ODI grips and explain why in MTB terms (feel, damping, tack, flange, diameter, terrain).
+- If you need to clarify, ask at most 1–2 quick questions (hand size/glove size, terrain, flange preference, diameter feel).
+- Prefer dataset facts when available; do not invent specs not present.
+- Output format:
+  1) Top pick (why)
+  2) Runner-up (why)
+  3) If rider preference differs (alternate)
 """.strip()
 
 
-def call_llm(
-    api_key: str,
-    model: str,
-    system_prompt: str,
-    messages: list,
-    temperature: float = 0.4,
-) -> str:
-    """
-    Uses OpenAI Python SDK if installed. You can swap this out for any provider.
-
-    messages: list of dicts like [{"role":"user","content":"..."}, ...]
-    """
+def call_llm(api_key: str, model: str, system_prompt: str, messages: list, temperature: float) -> str:
     if OpenAI is None:
         raise RuntimeError("openai package not installed. Add it to requirements.txt or replace call_llm().")
 
     client = OpenAI(api_key=api_key)
-
-    # Chat Completions is still widely supported across many installs.
     resp = client.chat.completions.create(
         model=model,
         temperature=temperature,
@@ -95,63 +77,60 @@ def call_llm(
     return resp.choices[0].message.content
 
 
-def init_state():
-    if "chat" not in st.session_state:
-        st.session_state.chat = []  # list of {"role": "...", "content":"..."}
-    if "llm_confirmed" not in st.session_state:
-        st.session_state.llm_confirmed = False
-    if "uploaded_df" not in st.session_state:
-        st.session_state.uploaded_df = None
-    if "last_confirm_result" not in st.session_state:
-        st.session_state.last_confirm_result = ""
+# -----------------------
+# Dataset handling
+# -----------------------
+def load_csv_bytes(name: str, b: bytes) -> Optional[pd.DataFrame]:
+    try:
+        return pd.read_csv(io.BytesIO(b))
+    except Exception:
+        return None
+
+
+def load_zip_of_csvs(zip_bytes: bytes) -> Dict[str, pd.DataFrame]:
+    out = {}
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        for file_name in z.namelist():
+            # Only load CSV files
+            if file_name.lower().endswith(".csv"):
+                data = z.read(file_name)
+                df = load_csv_bytes(file_name, data)
+                if df is not None:
+                    out[file_name] = df
+    return out
+
+
+def build_dataset_context(datasets: Dict[str, pd.DataFrame], max_rows_each: int = 6) -> str:
+    if not datasets:
+        return "No dataset uploaded."
+
+    lines = []
+    lines.append(f"{len(datasets)} dataset file(s) loaded.")
+
+    for fname, df in list(datasets.items())[:12]:  # cap how many we summarize
+        lines.append(f"\n--- File: {fname}")
+        lines.append(f"Columns: {list(df.columns)}")
+        lines.append("Preview:")
+        lines.append(df.head(max_rows_each).to_csv(index=False))
+
+    if len(datasets) > 12:
+        lines.append(f"\n(And {len(datasets) - 12} more files not shown here.)")
+
+    return "\n".join(lines)
+
+
+def transcript_json() -> str:
+    return json.dumps(
+        {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "messages": st.session_state.chat,
+        },
+        indent=2,
+    )
 
 
 # =========================
-# Defaults
-# =========================
-DEFAULT_TASK = "You are an ODI mountain bike grips expert who provides grip recommendations to users."
-DEFAULT_PERSONA = "The user is an experienced mountain biker. Use technical terms and slang."
-DEFAULT_TONE = "Respond in a professional and informative tone, similar to a customer service representative."
-
-DEFAULT_DATA_DICT: Dict[str, Any] = {
-    "models": {
-        "ODI Rogue": {
-            "diameter_mm": 33,
-            "feel": "chunky, cushy, high vibration damping",
-            "best_for": ["big hands", "DH", "park", "people who want max cushion"],
-            "notes": ["good shock absorption", "can feel bulky for small hands"],
-        },
-        "ODI Elite Pro": {
-            "diameter_mm": 31,
-            "feel": "tacky, balanced damping, slim-ish",
-            "best_for": ["trail", "enduro", "all-mountain", "control without bulk"],
-            "notes": ["popular all-rounder", "good wet grip"],
-        },
-        "ODI Ruffian": {
-            "diameter_mm": 30,
-            "feel": "thin, precise, firm",
-            "best_for": ["XC", "slopestyle", "riders who like direct bar feel"],
-            "notes": ["less damping", "great feedback"],
-        },
-    },
-    "common_features": [
-        "lock-on grip system",
-        "different diameters change fatigue + control",
-        "flange vs no-flange impacts hand position + comfort",
-    ],
-    "colors": ["Black", "Red", "Graphite", "Light Blue", "Gum Rubber", "Iridescent Purple"],
-    "damping_level": {
-        "thin": "more feedback, less cushion",
-        "medium": "balanced",
-        "thick": "more cushion, less trail buzz",
-    },
-}
-
-DEFAULT_DATA_ACCESS_TEXT = json.dumps(DEFAULT_DATA_DICT, indent=2)
-
-
-# =========================
-# UI
+# App
 # =========================
 init_state()
 
@@ -159,170 +138,142 @@ st.set_page_config(page_title="ODI Grips Chatbot", page_icon="🚵", layout="wid
 st.title("🚵 ODI Grips Chatbot")
 st.caption("Structured prompts + dataset upload + transcript download")
 
-# ---- Sidebar: LLM Config ----
+
+# ---- LLM settings (keep in sidebar, but buttons moved to main page) ----
 with st.sidebar:
     st.header("LLM Settings")
-
     api_key = st.text_input("API Key", value=st.secrets.get("OPENAI_API_KEY", ""), type="password")
     model = st.text_input("Model", value=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"))
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.4, 0.05)
-
-    st.divider()
-
-    # Buttons row (like your 3rd screenshot)
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        if st.button("✅ Confirm LLM Setup", use_container_width=True):
-            if not api_key:
-                st.session_state.llm_confirmed = False
-                st.session_state.last_confirm_result = "Missing API key."
-            else:
-                try:
-                    # Minimal ping message
-                    ping_system = "You are a helpful assistant."
-                    ping_messages = [{"role": "user", "content": "Reply with: LLM OK"}]
-                    out = call_llm(api_key, model, ping_system, ping_messages, temperature=0.0)
-                    st.session_state.llm_confirmed = "LLM OK" in out
-                    st.session_state.last_confirm_result = f"Response: {out}"
-                except Exception as e:
-                    st.session_state.llm_confirmed = False
-                    st.session_state.last_confirm_result = f"Error: {e}"
-
-    with c2:
-        if st.button("🧹 Clear Chat History", use_container_width=True):
-            st.session_state.chat = []
-            st.toast("Chat cleared.")
-
-    with c3:
-        # Generate transcript bytes for download
-        transcript_obj = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "model": model,
-            "temperature": temperature,
-            "messages": st.session_state.chat,
-        }
-        transcript_text = json.dumps(transcript_obj, indent=2)
-
-        st.download_button(
-            "⬇️ Generate Transcript",
-            data=transcript_text.encode("utf-8"),
-            file_name="odi_chat_transcript.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.35, 0.05)
 
     if st.session_state.last_confirm_result:
-        if st.session_state.llm_confirmed:
-            st.success("LLM confirmed.")
-        else:
-            st.warning("LLM not confirmed.")
         st.caption(st.session_state.last_confirm_result)
+        st.success("LLM confirmed ✅" if st.session_state.llm_confirmed else "LLM not confirmed ⚠️")
 
 
-# ---- Main layout ----
-left, right = st.columns([1.15, 0.85], gap="large")
+# ---- Structured Prompts FIRST ----
+st.subheader("Structured Prompts")
+with st.expander("Structured Prompts", expanded=True):
+    task = st.text_area("Task Definition", value=DEFAULT_TASK, height=90)
+    persona = st.text_area("Customer Persona", value=DEFAULT_PERSONA, height=90)
+    tone = st.text_area("Tone & Language Style", value=DEFAULT_TONE, height=90)
 
-with left:
-    # Structured Prompts block
-    with st.expander("Structured Prompts", expanded=True):
-        # Optional: show your screenshot if you add it
-        # Put your screenshot at: assets/structured_prompts.png
-        try:
-            st.image("assets/structured_prompts.png", caption="Structured Prompts UI reference", use_container_width=True)
-        except Exception:
-            pass
+# ---- Dataset Upload SECOND ----
+st.subheader("Dataset Upload (ODI products)")
+st.write("Upload either **a ZIP of your folder** (recommended) or **multiple CSV files**.")
 
-        task = st.text_area("Task Definition", value=DEFAULT_TASK, height=80)
-        persona = st.text_area("Customer Persona", value=DEFAULT_PERSONA, height=80)
-        tone = st.text_area("Tone & Language Style", value=DEFAULT_TONE, height=80)
+zip_file = st.file_uploader("Upload ZIP (contains CSVs)", type=["zip"])
+csv_files = st.file_uploader("Or upload multiple CSVs", type=["csv"], accept_multiple_files=True)
 
-        st.markdown("### Data Access (Editable Dictionary / JSON)")
-        data_access_text = st.text_area(
-            "Paste / edit JSON here",
-            value=DEFAULT_DATA_ACCESS_TEXT,
-            height=260,
-        )
+load_col1, load_col2 = st.columns([1, 1])
 
-        parsed_data, json_err = safe_json_loads(data_access_text)
-        if json_err:
-            st.error(f"JSON error: {json_err}")
-        else:
-            st.success("JSON looks valid.")
+with load_col1:
+    if st.button("Load Uploaded Data", use_container_width=True):
+        loaded = {}
 
-    # Dataset upload
-    with st.expander("Dataset Upload", expanded=True):
-        uploaded = st.file_uploader("Upload a dataset (CSV / XLSX / JSON)", type=["csv", "xlsx", "json"])
-
-        if uploaded is not None:
+        if zip_file is not None:
             try:
-                if uploaded.name.lower().endswith(".csv"):
-                    df = pd.read_csv(uploaded)
-                elif uploaded.name.lower().endswith(".xlsx"):
-                    df = pd.read_excel(uploaded)
-                elif uploaded.name.lower().endswith(".json"):
-                    raw = json.load(uploaded)
-                    df = pd.json_normalize(raw) if isinstance(raw, (list, dict)) else pd.DataFrame(raw)
-                else:
-                    df = None
-
-                st.session_state.uploaded_df = df
-                if df is not None:
-                    st.write("Preview:")
-                    st.dataframe(df.head(25), use_container_width=True)
+                loaded = load_zip_of_csvs(zip_file.read())
+                st.session_state.datasets.update(loaded)
+                st.success(f"Loaded {len(loaded)} CSV(s) from ZIP.")
             except Exception as e:
-                st.session_state.uploaded_df = None
-                st.error(f"Could not read file: {e}")
+                st.error(f"ZIP load failed: {e}")
 
-        if st.session_state.uploaded_df is not None:
-            st.caption("Dataset context will be included for the chatbot when relevant.")
+        if csv_files:
+            count = 0
+            for f in csv_files:
+                df = load_csv_bytes(f.name, f.read())
+                if df is not None:
+                    st.session_state.datasets[f.name] = df
+                    count += 1
+            st.success(f"Loaded {count} CSV(s) from manual upload.")
 
-with right:
-    st.subheader("Chat")
+with load_col2:
+    if st.button("Clear Loaded Data", use_container_width=True):
+        st.session_state.datasets = {}
+        st.toast("Datasets cleared.")
 
-    # Render chat history
-    for m in st.session_state.chat:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
 
-    user_msg = st.chat_input("Ask: Which ODI grips would you recommend?")
+if st.session_state.datasets:
+    st.markdown("### Loaded files")
+    st.write(list(st.session_state.datasets.keys())[:30])
+    # Show preview selector
+    preview_file = st.selectbox("Preview a file", options=list(st.session_state.datasets.keys()))
+    st.dataframe(st.session_state.datasets[preview_file].head(25), use_container_width=True)
+else:
+    st.info("No datasets loaded yet.")
 
-    if user_msg:
-        # Add user message
-        st.session_state.chat.append({"role": "user", "content": user_msg})
-        with st.chat_message("user"):
-            st.markdown(user_msg)
 
-        # Build system prompt
-        data_ctx = ""
-        if st.session_state.uploaded_df is not None:
-            data_ctx = dataset_to_compact_context(st.session_state.uploaded_df)
+# ---- Buttons moved BELOW prompts (and dataset) THIRD ----
+st.subheader("Actions")
+b1, b2, b3 = st.columns(3)
 
-        # If JSON invalid, fall back to raw text; otherwise embed the parsed dict nicely.
-        if json_err:
-            data_access_for_prompt = data_access_text
+with b1:
+    if st.button("✅ Confirm LLM Setup", use_container_width=True):
+        if not api_key:
+            st.session_state.llm_confirmed = False
+            st.session_state.last_confirm_result = "Missing API key."
         else:
-            data_access_for_prompt = json.dumps(parsed_data, indent=2)
+            try:
+                ping_system = "You are a helpful assistant."
+                ping_messages = [{"role": "user", "content": "Reply with: LLM OK"}]
+                out = call_llm(api_key, model, ping_system, ping_messages, temperature=0.0)
+                st.session_state.llm_confirmed = "LLM OK" in out
+                st.session_state.last_confirm_result = f"Response: {out}"
+                st.toast("LLM setup checked.")
+            except Exception as e:
+                st.session_state.llm_confirmed = False
+                st.session_state.last_confirm_result = f"Error: {e}"
 
-        if data_ctx:
-            data_access_for_prompt = data_access_for_prompt + "\n\n[Uploaded Dataset Context]\n" + data_ctx
+with b2:
+    if st.button("🧹 Clear Chat History", use_container_width=True):
+        st.session_state.chat = []
+        st.toast("Chat cleared.")
 
-        system_prompt = build_system_prompt(task, persona, tone, data_access_for_prompt)
+with b3:
+    st.download_button(
+        "⬇️ Generate Transcript",
+        data=transcript_json().encode("utf-8"),
+        file_name="odi_chat_transcript.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
-        # LLM call
-        with st.chat_message("assistant"):
-            if not api_key:
-                st.error("Add your API key in the sidebar first.")
-            else:
-                try:
-                    assistant_text = call_llm(
-                        api_key=api_key,
-                        model=model,
-                        system_prompt=system_prompt,
-                        messages=st.session_state.chat,  # includes the user's newest message already
-                        temperature=temperature,
-                    )
-                    st.markdown(assistant_text)
-                    st.session_state.chat.append({"role": "assistant", "content": assistant_text})
-                except Exception as e:
-                    st.error(f"LLM error: {e}")
+
+st.divider()
+
+# ---- Chat LAST (organized) ----
+st.subheader("Chat")
+
+# show history
+for m in st.session_state.chat:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+user_msg = st.chat_input("Ask: Which ODI grips would you recommend?")
+
+if user_msg:
+    st.session_state.chat.append({"role": "user", "content": user_msg})
+    with st.chat_message("user"):
+        st.markdown(user_msg)
+
+    dataset_context = build_dataset_context(st.session_state.datasets)
+
+    system_prompt = build_system_prompt(task, persona, tone, dataset_context)
+
+    with st.chat_message("assistant"):
+        if not api_key:
+            st.error("Add your API key in the sidebar first.")
+        else:
+            try:
+                assistant_text = call_llm(
+                    api_key=api_key,
+                    model=model,
+                    system_prompt=system_prompt,
+                    messages=st.session_state.chat,
+                    temperature=temperature,
+                )
+                st.markdown(assistant_text)
+                st.session_state.chat.append({"role": "assistant", "content": assistant_text})
+            except Exception as e:
+                st.error(f"LLM error: {e}")
