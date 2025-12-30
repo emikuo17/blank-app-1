@@ -1,3 +1,5 @@
+# Full Streamlit App with RAG (Retrieval-Augmented Generation) for ODI Grip Chatbot
+
 import json
 import time
 from typing import Optional, Dict, List, Any
@@ -6,145 +8,67 @@ import pandas as pd
 import requests
 import streamlit as st
 
+import chromadb
+from chromadb.utils import embedding_functions
+from sentence_transformers import SentenceTransformer
 
-# -----------------------
-# State
-# -----------------------
+# ------------------
+# Initialize State
+# ------------------
 def init_state():
     if "chat" not in st.session_state:
-        st.session_state.chat = []  # [{"role":"user|assistant","content":"..."}]
-    if "llm_confirmed" not in st.session_state:
-        st.session_state.llm_confirmed = False
-    if "last_confirm_result" not in st.session_state:
-        st.session_state.last_confirm_result = ""
+        st.session_state.chat = []
     if "datasets" not in st.session_state:
-        st.session_state.datasets = {}  # filename -> dataframe
+        st.session_state.datasets = {}
+    if "vector_db" not in st.session_state:
+        st.session_state.vector_db = None
+    if "embed_model" not in st.session_state:
+        st.session_state.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-# -----------------------
-# Defaults (Structured Prompts)
-# -----------------------
-DEFAULT_TASK = "You are an ODI mountain bike grips expert who provides grip recommendations to users."
-DEFAULT_PERSONA = "The user is an experienced mountain biker. Use technical terms and slang."
-DEFAULT_TONE = "Respond in a professional and informative tone, similar to a customer service representative."
-
-DEFAULT_DATA_RULES = """DATA RULES (STRICT):
-- Use ONLY information available in the uploaded ODI product dataset provided by the app.
-- Do NOT browse the web, cite webpages, or use external reviews/knowledge.
-- Do NOT invent features, prices, specs, availability, or “best overall” claims.
-- If a detail is not in the dataset, say you’re not sure and ask a clarifying question instead.
-- Only ODI grips are allowed. Never recommend competitor brands.
-"""
-
-DEFAULT_SCOPE = """SCOPE:
-This assistant supports ALL ODI grips that exist in the uploaded dataset (e.g., MTB, BMX, Moto, Urban/Casual).
-If the user asks about a category that is not present in the dataset, explain the limitation and guide them to supported grips.
-Identify the riding category early (MTB vs BMX vs Moto vs Casual) because it strongly affects which grips fit.
-"""
-
-DEFAULT_PREF_SCHEMA = """PREFERENCES (ONLY THESE AFFECT RECOMMENDATIONS):
-Keys:
-- riding_style
-- locking_mechanism
-- thickness
-- damping_level
-- durability
-
-Allowed values:
-riding_style: trail, enduro, downhill, cross-country, bmx, moto, urban, casual
-locking_mechanism: lock-on, slip-on
-thickness: thin, medium, thick, medium-thick size xl
-damping_level: low, medium, high
-durability: low, medium, high
-
-Rules:
-- Only set a preference if the user clearly indicates it.
-- If unclear, leave it unset and ask ONE follow-up question.
-"""
-
-DEFAULT_MAPPING = """MAPPING HINTS (use only when intent is clear):
-riding_style:
-- “BMX / park / street tricks” -> bmx
-- “Rocky trails / mixed terrain / all-mountain” -> trail
-- “Enduro / aggressive trail / rough descents” -> enduro
-- “Downhill / bike park / steep fast” -> downhill
-- “XC / racing / long climbs” -> cross-country
-- “Moto” -> moto
-- “Commuting / city rides” -> urban
-- “Casual cruising / e-bike comfort” -> casual
-
-thickness:
-- “small hands / slim / skinny” -> thin
-- “chunky / fat / big / extra padding” -> thick
-- “large hands / XL gloves” -> medium-thick size xl (only if user indicates XL/very large hands)
-
-damping_level:
-- “hands numb / vibration / shock absorption / rocky” -> high
-- “balanced” -> medium
-- “more trail feel / firm” -> low
-
-locking_mechanism:
-- “lock-on / clamps” -> lock-on
-- “slip-on / push-on” -> slip-on
-
-durability:
-- “long-lasting / hard riding / abrasive trails” -> high
-"""
-
-DEFAULT_WORKFLOW = """WORKFLOW:
-1) Welcome the user and ask what they ride + what problem they want to solve (comfort, control, numbness, hand size, etc.).
-2) Identify riding_style early if possible.
-3) Ask ONE focused follow-up question at a time to fill missing preferences.
-4) Once enough preferences are collected, recommend grips based ONLY on the dataset.
-5) Briefly explain why the suggested grips match the stated preferences, without adding unsupported details.
-"""
-
-DEFAULT_OUTPUT_RULES = """RESPONSE FORMAT:
-- Keep replies short (2–6 sentences).
-- Always include:
-  (a) 1 quick acknowledgment of the user’s situation
-  (b) 1 helpful suggestion or explanation based on their needs
-  (c) ONE follow-up question if preferences are still missing
-
-Avoid:
-- long bullet lists
-- multiple follow-up questions in one message
-- technical jargon unless the user clearly uses it first
-"""
+# ------------------
+# Vector DB Functions
+# ------------------
+def init_vector_db():
+    client = chromadb.Client()
+    collection = client.create_collection("odi_grips")
+    st.session_state.vector_db = collection
 
 
-# -----------------------
-# Prompt + Dataset Context
-# -----------------------
-def build_dataset_context(datasets: Dict[str, pd.DataFrame], max_rows_each: int = 8) -> str:
-    """Compact dataset summary for grounding. Keeps prompt smaller than dumping full CSVs."""
-    if not datasets:
-        return "No dataset uploaded yet. You must ask the user to upload ODI product CSV files."
-
-    lines = [f"{len(datasets)} ODI dataset file(s) loaded."]
-    for fname, df in list(datasets.items())[:10]:
-        lines.append(f"\n--- File: {fname}")
-        lines.append(f"Columns: {list(df.columns)}")
-        lines.append("Preview:")
-        lines.append(df.head(max_rows_each).to_csv(index=False))
-
-    if len(datasets) > 10:
-        lines.append(f"\n(And {len(datasets) - 10} more files.)")
-    return "\n".join(lines)
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    return st.session_state.embed_model.encode(texts).tolist()
 
 
-def build_system_prompt(
-    task: str,
-    persona: str,
-    tone: str,
-    data_rules: str,
-    scope: str,
-    pref_schema: str,
-    mapping_guide: str,
-    workflow: str,
-    output_rules: str,
-    dataset_context: str,
-) -> str:
+def add_csv_to_vector_db(datasets: Dict[str, pd.DataFrame]):
+    if st.session_state.vector_db is None:
+        init_vector_db()
+
+    all_texts, metadatas, ids = [], [], []
+    chunk_id = 0
+    for fname, df in datasets.items():
+        for _, row in df.iterrows():
+            text = ", ".join([f"{col}: {row[col]}" for col in df.columns if pd.notna(row[col])])
+            all_texts.append(text)
+            metadatas.append({"source_file": fname})
+            ids.append(f"chunk-{chunk_id}")
+            chunk_id += 1
+
+    embeddings = embed_texts(all_texts)
+    st.session_state.vector_db.add(documents=all_texts, embeddings=embeddings, metadatas=metadatas, ids=ids)
+
+
+def rag_retrieve_context(query: str, top_k: int = 5) -> str:
+    if st.session_state.vector_db is None:
+        return "No product knowledge loaded."
+    query_vec = embed_texts([query])[0]
+    results = st.session_state.vector_db.query(query_embeddings=[query_vec], n_results=top_k)
+    return "\n\n".join(results["documents"][0]) if results["documents"] else "No relevant info found."
+
+
+# ------------------
+# Prompt Builder
+# ------------------
+def build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context):
     return f"""
 [Task Definition]
 {task}
@@ -173,258 +97,96 @@ def build_system_prompt(
 [Output Format Rules]
 {output_rules}
 
-[Uploaded Dataset Context]
-{dataset_context}
+[RAG Context Retrieved for this Query]
+{rag_context}
 
 IMPORTANT:
-- If the dataset is missing or does not contain the requested category/specs, say so clearly and ask ONE follow-up question.
-- Do NOT invent. Do NOT use outside knowledge.
+- Use ONLY the context above. Do NOT invent.
+- If the context lacks details, ask a follow-up question.
 """.strip()
 
 
-# -----------------------
-# OpenRouter LLM Call (fixes your "openai package not installed" issue)
-# -----------------------
-def call_llm_openrouter(
-    api_key: str,
-    model: str,
-    system_prompt: str,
-    messages: List[Dict[str, str]],
-    temperature: float = 0.2,
-    max_tokens: int = 600,
-) -> str:
-    """
-    Calls OpenRouter Chat Completions API via HTTPS (no openai SDK required).
-    """
+# ------------------
+# LLM Call
+# ------------------
+def call_llm_openrouter(api_key: str, model: str, system_prompt: str, messages: List[Dict[str, str]]) -> str:
     url = "https://openrouter.ai/api/v1/chat/completions"
-
-    # OpenRouter expects messages in OpenAI-like format
-    payload: Dict[str, Any] = {
+    payload = {
         "model": model,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "max_tokens": 600,
         "messages": [{"role": "system", "content": system_prompt}] + messages,
     }
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # These two headers are recommended by OpenRouter (safe to include)
         "HTTP-Referer": "http://localhost:8501",
-        "X-Title": "ODI Grips Chatbot (Streamlit)",
+        "X-Title": "ODI Grips Chatbot (RAG)",
     }
-
     resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-    if resp.status_code != 200:
-        # Provide useful debugging info without dumping secrets
-        raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
-
     data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        raise RuntimeError(f"Unexpected OpenRouter response format: {json.dumps(data)[:1200]}")
+    return data["choices"][0]["message"]["content"]
 
 
-# -----------------------
-# CSV Loading + Transcript
-# -----------------------
-def load_csv_uploaded_file(uploaded_file) -> Optional[pd.DataFrame]:
-    try:
-        return pd.read_csv(uploaded_file)
-    except Exception:
-        # if it fails due to encoding, try a fallback
-        try:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding="latin-1")
-        except Exception:
-            return None
-
-
-def transcript_json() -> str:
-    return json.dumps(
-        {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "messages": st.session_state.chat,
-        },
-        indent=2,
-    )
-
-
-# =========================
-# App
-# =========================
+# ------------------
+# Streamlit UI
+# ------------------
 init_state()
 
-st.set_page_config(page_title="ODI Grips Chatbot", page_icon="🚵", layout="wide")
-st.title("🚵 ODI Grips Chatbot")
-st.caption("Structured prompts + dataset upload + transcript download")
+st.set_page_config(page_title="ODI Grips Chatbot with RAG", layout="wide")
+st.title("🚵 ODI Grips Chatbot with RAG")
 
-
-# Sidebar: OpenRouter settings (no temperature slider)
+# Sidebar config
 with st.sidebar:
-    st.header("LLM Settings (OpenRouter)")
+    st.header("LLM Settings")
+    api_key = st.text_input("OpenRouter API Key", type="password")
+    model = st.text_input("Model", value="openai/gpt-4o-mini")
 
-    # Keep API key input box as requested
-    api_key = st.text_input(
-        "OpenRouter API Key",
-        value=st.secrets.get("OPENROUTER_API_KEY", ""),
-        type="password",
-        help="Paste your OpenRouter API key here.",
-    )
+# Prompt controls
+st.subheader("Prompt Controls")
+task = st.text_area("Task", value="You are an ODI grip expert helping riders choose the right grips.")
+persona = st.text_area("Persona", value="The user is a mountain biker who wants comfort and control.")
+tone = st.text_area("Tone", value="Friendly, knowledgeable, and brief.")
+data_rules = st.text_area("Data Rules", value="Use only product info retrieved. Never invent.")
+scope = st.text_area("Scope", value="All ODI grips across all riding categories.")
+pref_schema = st.text_area("Preference Schema", value="riding_style, thickness, locking_mechanism, damping")
+mapping_guide = st.text_area("Mapping Guide", value="‘large hands’ = ‘thick’ grip")
+workflow = st.text_area("Workflow", value="1. Ask riding type. 2. Identify needs. 3. Recommend grip.")
+output_rules = st.text_area("Output Rules", value="Keep replies under 6 sentences. Use plain English.")
 
-    # OpenRouter model names are typically like: openai/gpt-4o-mini, anthropic/claude-3.5-sonnet, etc.
-    model = st.text_input(
-        "Model",
-        value=st.secrets.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-        help="Example: openai/gpt-4o-mini",
-    )
+# Upload and Embed
+st.subheader("📁 Upload ODI Grip CSVs")
+csv_files = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True)
+if st.button("🔄 Load and Embed CSVs"):
+    st.session_state.datasets = {}
+    for f in csv_files:
+        df = pd.read_csv(f)
+        st.session_state.datasets[f.name] = df
+    add_csv_to_vector_db(st.session_state.datasets)
+    st.success("Data loaded and embedded into RAG database.")
 
-    if st.session_state.last_confirm_result:
-        st.caption(st.session_state.last_confirm_result)
-        st.success("LLM confirmed ✅" if st.session_state.llm_confirmed else "LLM not confirmed ⚠️")
-
-
-# ---- Structured Prompts ----
-st.subheader("Structured Prompts")
-with st.expander("Structured Prompts", expanded=True):
-    task = st.text_area("1) Task Definition", value=DEFAULT_TASK, height=90)
-    persona = st.text_area("2) Customer Persona", value=DEFAULT_PERSONA, height=90)
-    tone = st.text_area("3) Tone & Language Style", value=DEFAULT_TONE, height=90)
-
-    st.markdown("#### Added grounding + control sections")
-    data_rules = st.text_area("4) Data Access & Grounding Rules", value=DEFAULT_DATA_RULES, height=180)
-    scope = st.text_area("5) Scope & Category Handling", value=DEFAULT_SCOPE, height=150)
-    pref_schema = st.text_area("6) Preference Schema (What the app tracks)", value=DEFAULT_PREF_SCHEMA, height=220)
-    mapping_guide = st.text_area("7) Mapping Guide (User language → preferences)", value=DEFAULT_MAPPING, height=320)
-    workflow = st.text_area("8) Conversation Workflow", value=DEFAULT_WORKFLOW, height=170)
-    output_rules = st.text_area("9) Output Format Rules (Consistency)", value=DEFAULT_OUTPUT_RULES, height=190)
-
-
-# ---- Dataset Upload (multiple CSV only) ----
-st.subheader("Dataset Upload (ODI products)")
-st.write("Upload **multiple CSV files** from your `ODI products` folder.")
-
-csv_files = st.file_uploader("Upload CSV files", type=["csv"], accept_multiple_files=True)
-
-c1, c2 = st.columns([1, 1])
-with c1:
-    if st.button("Load Uploaded CSVs", use_container_width=True):
-        if not csv_files:
-            st.warning("No CSVs selected yet.")
-        else:
-            count = 0
-            for f in csv_files:
-                df = load_csv_uploaded_file(f)
-                if df is not None:
-                    st.session_state.datasets[f.name] = df
-                    count += 1
-            st.success(f"Loaded {count} CSV file(s).")
-
-with c2:
-    if st.button("Clear Loaded Data", use_container_width=True):
-        st.session_state.datasets = {}
-        st.toast("Datasets cleared.")
-
-
-if st.session_state.datasets:
-    st.markdown("### Loaded files")
-    st.write(list(st.session_state.datasets.keys())[:40])
-
-    preview_file = st.selectbox("Preview a file", options=list(st.session_state.datasets.keys()))
-    st.dataframe(st.session_state.datasets[preview_file].head(25), use_container_width=True)
-else:
-    st.info("No datasets loaded yet.")
-
-
-# ---- Actions row BELOW Structured Prompts + Dataset ----
-st.subheader("Actions")
-b1, b2, b3 = st.columns(3)
-
-with b1:
-    if st.button("✅ Confirm LLM Setup", use_container_width=True):
-        if not api_key:
-            st.session_state.llm_confirmed = False
-            st.session_state.last_confirm_result = "Missing OpenRouter API key."
-        else:
-            try:
-                ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
-                ping_messages = [{"role": "user", "content": "LLM OK"}]
-                out = call_llm_openrouter(
-                    api_key=api_key,
-                    model=model,
-                    system_prompt=ping_system,
-                    messages=ping_messages,
-                    temperature=0.0,
-                    max_tokens=10,
-                )
-                st.session_state.llm_confirmed = "LLM OK" in out
-                st.session_state.last_confirm_result = f"Response: {out}"
-                st.toast("LLM setup checked.")
-            except Exception as e:
-                st.session_state.llm_confirmed = False
-                st.session_state.last_confirm_result = f"Error: {e}"
-
-with b2:
-    if st.button("🧹 Clear Chat History", use_container_width=True):
-        st.session_state.chat = []
-        st.toast("Chat cleared.")
-
-with b3:
-    st.download_button(
-        "⬇️ Generate Transcript",
-        data=transcript_json().encode("utf-8"),
-        file_name="odi_chat_transcript.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-
-st.divider()
-
-# ---- Chat LAST (organized) ----
-st.subheader("Chat")
-
+# Chat
+st.subheader("💬 Chat")
 for m in st.session_state.chat:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-user_msg = st.chat_input("Ask: Which ODI grips would you recommend?")
-
+user_msg = st.chat_input("Ask a grip question...")
 if user_msg:
     st.session_state.chat.append({"role": "user", "content": user_msg})
     with st.chat_message("user"):
         st.markdown(user_msg)
 
-    dataset_context = build_dataset_context(st.session_state.datasets)
-
-    system_prompt = build_system_prompt(
-        task=task,
-        persona=persona,
-        tone=tone,
-        data_rules=data_rules,
-        scope=scope,
-        pref_schema=pref_schema,
-        mapping_guide=mapping_guide,
-        workflow=workflow,
-        output_rules=output_rules,
-        dataset_context=dataset_context,
-    )
+    rag_context = rag_retrieve_context(user_msg)
+    full_prompt = build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context)
 
     with st.chat_message("assistant"):
         if not api_key:
-            st.error("Add your OpenRouter API key in the sidebar first.")
+            st.error("Please enter your API key.")
         else:
             try:
-                assistant_text = call_llm_openrouter(
-                    api_key=api_key,
-                    model=model,
-                    system_prompt=system_prompt,
-                    messages=st.session_state.chat,
-                    temperature=0.2,
-                    max_tokens=700,
-                )
-                st.markdown(assistant_text)
-                st.session_state.chat.append({"role": "assistant", "content": assistant_text})
+                reply = call_llm_openrouter(api_key, model, full_prompt, st.session_state.chat)
+                st.markdown(reply)
+                st.session_state.chat.append({"role": "assistant", "content": reply})
             except Exception as e:
                 st.error(f"LLM error: {e}")
