@@ -78,6 +78,7 @@ DEFAULT_DATA_RULES = """DATA RULES (STRICT):
 DEFAULT_SCOPE = """SCOPE:
 This assistant supports ALL ODI grips in the dataset (e.g., MTB, BMX, Moto, Urban/Casual).
 If the user asks about a category not supported, explain the limitation and ask follow-up.
+Identify the riding category early (MTB vs BMX vs Moto vs Casual) because it strongly affects which grips fit.
 """
 DEFAULT_PREF_SCHEMA = """PREFERENCES:
 - riding_style: trail, enduro, downhill, cross-country, bmx, moto, urban, casual
@@ -86,16 +87,33 @@ DEFAULT_PREF_SCHEMA = """PREFERENCES:
 - damping_level: low, medium, high
 - durability: low, medium, high
 """
-DEFAULT_MAPPING = """MAPPING HINTS:
-- “large hands / XL gloves” -> medium-thick size xl
-- “shock absorption / vibration” -> high damping
+DEFAULT_MAPPING = """MAPPING HINTS (use only when intent is clear): 
+riding_style: 
+- “BMX / park / street tricks” -> bmx 
+- “Rocky trails / mixed terrain / all-mountain” -> trail 
+- “Enduro / aggressive trail / rough descents” -> enduro 
+- “Downhill / bike park / steep fast” -> downhill 
+- “XC / racing / long climbs” -> cross-country 
+- “Moto” -> moto 
+- “Commuting / city rides” -> urban 
+- “Casual cruising / e-bike comfort” -> casual thickness: 
+- “small hands / slim / skinny” -> thin 
+- “chunky / fat / big / extra padding” -> thick 
+- “large hands / XL gloves” -> medium-thick size xl (only if user indicates XL/very large hands) 
+
+damping_level: 
+- “hands numb / vibration / shock absorption / rocky” -> high - “balanced” -> medium 
+- “more trail feel / firm” -> low locking_mechanism: 
+- “lock-on / clamps” -> lock-on 
+- “slip-on / push-on” -> slip-on durability: 
+- “long-lasting / hard riding / abrasive trails” -> high
 """
 DEFAULT_WORKFLOW = """WORKFLOW:
-1) Ask what bike and problem the user has
-2) Identify riding_style early if possible
-3) Ask ONE follow-up if preferences unclear
-4) Recommend based ONLY on matched chunks
-5) Explain match briefly and clearly
+1) Welcome the user and ask what they ride + what problem they want to solve (comfort, control, numbness, hand size, etc.). 
+2) Identify riding_style early if possible. 
+3) Ask ONE focused follow-up question at a time to fill missing preferences. 
+4) Once enough preferences are collected, recommend grips based ONLY on the dataset. 
+5) Briefly explain why the suggested grips match the stated preferences, without adding unsupported details.
 """
 DEFAULT_OUTPUT_RULES = """RESPONSE FORMAT:
 - Replies = 2–6 sentences
@@ -203,6 +221,44 @@ with st.expander("🧠 Structured Prompt Controls", expanded=True):
     workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
     output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
 
+# ---- Actions Row (LLM Setup / Clear / Export) ----
+st.subheader("Actions")
+a1, a2, a3 = st.columns(3)
+
+with a1:
+    if st.button("✅ Confirm LLM Setup", use_container_width=True):
+        if not api_key:
+            st.session_state.llm_confirmed = False
+            st.session_state.last_confirm_result = "Missing OpenRouter API key."
+        else:
+            try:
+                ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
+                ping_messages = [{"role": "user", "content": "LLM OK"}]
+                out = call_llm_openrouter(api_key, model, ping_system, ping_messages, temperature=0.0, max_tokens=10)
+                st.session_state.llm_confirmed = "LLM OK" in out
+                st.session_state.last_confirm_result = f"Response: {out}"
+                st.toast("LLM setup checked.")
+            except Exception as e:
+                st.session_state.llm_confirmed = False
+                st.session_state.last_confirm_result = f"Error: {e}"
+
+with a2:
+    if st.button("🧹 Clear Chat History", use_container_width=True):
+        st.session_state.chat = []
+        st.toast("Chat history cleared.")
+
+with a3:
+    def transcript_json():
+        return json.dumps({"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "messages": st.session_state.chat}, indent=2)
+
+    st.download_button(
+        "⬇️ Download Transcript",
+        data=transcript_json().encode("utf-8"),
+        file_name="odi_chat_transcript.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
 # Chat section
 st.subheader("💬 Chat")
 for m in st.session_state.chat:
@@ -225,4 +281,3 @@ if user_msg:
             st.session_state.chat.append({"role": "assistant", "content": reply})
         except Exception as e:
             st.error(str(e))
-
