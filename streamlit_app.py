@@ -1,16 +1,10 @@
-import io
 import json
 import time
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 
 import pandas as pd
+import requests
 import streamlit as st
-
-# Optional OpenAI SDK
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
 
 # -----------------------
@@ -120,7 +114,7 @@ Avoid:
 
 
 # -----------------------
-# Prompt + LLM
+# Prompt + Dataset Context
 # -----------------------
 def build_dataset_context(datasets: Dict[str, pd.DataFrame], max_rows_each: int = 8) -> str:
     """Compact dataset summary for grounding. Keeps prompt smaller than dumping full CSVs."""
@@ -188,21 +182,53 @@ IMPORTANT:
 """.strip()
 
 
-def call_llm(api_key: str, model: str, system_prompt: str, messages: list) -> str:
-    if OpenAI is None:
-        raise RuntimeError("openai package not installed. Add it to requirements.txt or replace call_llm().")
+# -----------------------
+# OpenRouter LLM Call (fixes your "openai package not installed" issue)
+# -----------------------
+def call_llm_openrouter(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 600,
+) -> str:
+    """
+    Calls OpenRouter Chat Completions API via HTTPS (no openai SDK required).
+    """
+    url = "https://openrouter.ai/api/v1/chat/completions"
 
-    client = OpenAI(api_key=api_key)
+    # OpenRouter expects messages in OpenAI-like format
+    payload: Dict[str, Any] = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
+    }
 
-    # Temperature removed: we keep it deterministic-ish by defaulting low.
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        messages=[{"role": "system", "content": system_prompt}] + messages,
-    )
-    return resp.choices[0].message.content
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # These two headers are recommended by OpenRouter (safe to include)
+        "HTTP-Referer": "http://localhost:8501",
+        "X-Title": "ODI Grips Chatbot (Streamlit)",
+    }
+
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+    if resp.status_code != 200:
+        # Provide useful debugging info without dumping secrets
+        raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        raise RuntimeError(f"Unexpected OpenRouter response format: {json.dumps(data)[:1200]}")
 
 
+# -----------------------
+# CSV Loading + Transcript
+# -----------------------
 def load_csv_uploaded_file(uploaded_file) -> Optional[pd.DataFrame]:
     try:
         return pd.read_csv(uploaded_file)
@@ -235,11 +261,24 @@ st.title("🚵 ODI Grips Chatbot")
 st.caption("Structured prompts + dataset upload + transcript download")
 
 
-# Sidebar: only essentials now (no temperature)
+# Sidebar: OpenRouter settings (no temperature slider)
 with st.sidebar:
-    st.header("LLM Settings")
-    api_key = st.text_input("API Key", value=st.secrets.get("OPENAI_API_KEY", ""), type="password")
-    model = st.text_input("Model", value=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"))
+    st.header("LLM Settings (OpenRouter)")
+
+    # Keep API key input box as requested
+    api_key = st.text_input(
+        "OpenRouter API Key",
+        value=st.secrets.get("OPENROUTER_API_KEY", ""),
+        type="password",
+        help="Paste your OpenRouter API key here.",
+    )
+
+    # OpenRouter model names are typically like: openai/gpt-4o-mini, anthropic/claude-3.5-sonnet, etc.
+    model = st.text_input(
+        "Model",
+        value=st.secrets.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        help="Example: openai/gpt-4o-mini",
+    )
 
     if st.session_state.last_confirm_result:
         st.caption(st.session_state.last_confirm_result)
@@ -306,12 +345,19 @@ with b1:
     if st.button("✅ Confirm LLM Setup", use_container_width=True):
         if not api_key:
             st.session_state.llm_confirmed = False
-            st.session_state.last_confirm_result = "Missing API key."
+            st.session_state.last_confirm_result = "Missing OpenRouter API key."
         else:
             try:
                 ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
                 ping_messages = [{"role": "user", "content": "LLM OK"}]
-                out = call_llm(api_key, model, ping_system, ping_messages)
+                out = call_llm_openrouter(
+                    api_key=api_key,
+                    model=model,
+                    system_prompt=ping_system,
+                    messages=ping_messages,
+                    temperature=0.0,
+                    max_tokens=10,
+                )
                 st.session_state.llm_confirmed = "LLM OK" in out
                 st.session_state.last_confirm_result = f"Response: {out}"
                 st.toast("LLM setup checked.")
@@ -367,14 +413,16 @@ if user_msg:
 
     with st.chat_message("assistant"):
         if not api_key:
-            st.error("Add your API key in the sidebar first.")
+            st.error("Add your OpenRouter API key in the sidebar first.")
         else:
             try:
-                assistant_text = call_llm(
+                assistant_text = call_llm_openrouter(
                     api_key=api_key,
                     model=model,
                     system_prompt=system_prompt,
                     messages=st.session_state.chat,
+                    temperature=0.2,
+                    max_tokens=700,
                 )
                 st.markdown(assistant_text)
                 st.session_state.chat.append({"role": "assistant", "content": assistant_text})
