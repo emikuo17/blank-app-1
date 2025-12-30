@@ -192,16 +192,16 @@ if st.button("🔄 Load & Embed CSVs"):
 
 # Prompt settings
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
-st.subheader("Structured Prompt Controls")
-task = st.text_area("Task", value=DEFAULT_TASK)
-persona = st.text_area("Persona", value=DEFAULT_PERSONA)
-tone = st.text_area("Tone", value=DEFAULT_TONE)
-data_rules = st.text_area("Data Rules", value=DEFAULT_DATA_RULES)
-scope = st.text_area("Scope", value=DEFAULT_SCOPE)
-pref_schema = st.text_area("Preferences", value=DEFAULT_PREF_SCHEMA)
-mapping_guide = st.text_area("Mapping", value=DEFAULT_MAPPING)
-workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
-output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
+    st.subheader("Prompt Settings")
+    task = st.text_area("Task", value=DEFAULT_TASK)
+    persona = st.text_area("Persona", value=DEFAULT_PERSONA)
+    tone = st.text_area("Tone", value=DEFAULT_TONE)
+    data_rules = st.text_area("Data Rules", value=DEFAULT_DATA_RULES)
+    scope = st.text_area("Scope", value=DEFAULT_SCOPE)
+    pref_schema = st.text_area("Preferences", value=DEFAULT_PREF_SCHEMA)
+    mapping_guide = st.text_area("Mapping", value=DEFAULT_MAPPING)
+    workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
+    output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
 
 # Chat section
 st.subheader("💬 Chat")
@@ -225,3 +225,4 @@ if user_msg:
             st.session_state.chat.append({"role": "assistant", "content": reply})
         except Exception as e:
             st.error(str(e))
+
